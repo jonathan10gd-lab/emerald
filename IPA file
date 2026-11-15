@@ -1,0 +1,341 @@
+name: Build Emerald IPA
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p Sources
+          cat > project.yml <<'EOF'
+          name: PokeEmu
+          options:
+            deploymentTarget: {iOS: "16.0"}
+          packages:
+            ZIPFoundation: {url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.19"}
+          targets:
+            PokeEmu:
+              type: application
+              platform: iOS
+              sources: [Sources]
+              dependencies: [{package: ZIPFoundation}]
+              info:
+                path: Sources/Info.plist
+                properties:
+                  CFBundleDisplayName: Emerald
+                  UILaunchScreen: {}
+                  UIRequiresFullScreen: true
+                  UIStatusBarHidden: true
+                  UIFileSharingEnabled: true
+                  LSSupportsOpeningDocumentsInPlace: true
+                  UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+                  UISupportedInterfaceOrientations~ipad: [UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.example.emerald
+                  SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge.h
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  HEADER_SEARCH_PATHS: ["$(SRCROOT)/mgba/include", "$(SRCROOT)/build/include"]
+                  OTHER_LDFLAGS: ["$(SRCROOT)/build/libmgba.a", "-lz"]
+          EOF
+          cat > Sources/Bridge.h <<'EOF'
+          #include <stdint.h>
+          int shim_load(const char *path);
+          unsigned shim_width(void);
+          unsigned shim_height(void);
+          const uint32_t *shim_video(void);
+          int shim_frame(uint32_t keys, int16_t *audioOut, int maxFrames);
+          uint8_t shim_read8(uint32_t addr);
+          uint16_t shim_read16(uint32_t addr);
+          uint32_t shim_read32(uint32_t addr);
+          EOF
+          cat > Sources/shim.c <<'EOF'
+          #include <mgba/core/core.h>
+          #include <mgba/core/blip_buf.h>
+          #include <stdlib.h>
+          #include "Bridge.h"
+          static struct mCore *core; static uint32_t *vbuf; static unsigned W, H;
+          int shim_load(const char *path) {
+            core = mCoreFind(path); if (!core) return 0;
+            core->init(core); mCoreInitConfig(core, NULL);
+            core->baseVideoSize(core, &W, &H);
+            vbuf = calloc(W * H, 4); core->setVideoBuffer(core, vbuf, W);
+            if (!mCoreLoadFile(core, path)) return 0;
+            mCoreAutoloadSave(core);
+            core->reset(core);
+            blip_set_rates(core->getAudioChannel(core, 0), core->frequency(core), 48000);
+            blip_set_rates(core->getAudioChannel(core, 1), core->frequency(core), 48000);
+            return 1;
+          }
+          unsigned shim_width(void) { return W; }
+          unsigned shim_height(void) { return H; }
+          const uint32_t *shim_video(void) { return vbuf; }
+          uint8_t shim_read8(uint32_t a) { return core->busRead8(core, a); }
+          uint16_t shim_read16(uint32_t a) { return core->busRead16(core, a); }
+          uint32_t shim_read32(uint32_t a) { return core->busRead32(core, a); }
+          int shim_frame(uint32_t keys, int16_t *out, int max) {
+            core->setKeys(core, keys); core->runFrame(core);
+            blip_t *l = core->getAudioChannel(core, 0), *r = core->getAudioChannel(core, 1);
+            int n = blip_samples_avail(l); if (n > max) n = max;
+            blip_read_samples(l, out, n, 1); blip_read_samples(r, out + 1, n, 1);
+            return n;
+          }
+          EOF
+          cat > Sources/App.swift <<'EOF'
+          import SwiftUI
+          import GameController
+          import AVFoundation
+          import ZIPFoundation
+          import UniformTypeIdentifiers
+
+          @main struct EmeraldApp: App {
+            @StateObject var emu = Emu()
+            @State private var picking = false
+            var body: some Scene {
+              WindowGroup {
+                ZStack {
+                  Color.black
+                  if emu.running {
+                    GeometryReader { geo in
+                      let d = min(geo.size.height / 6.6, geo.size.width * 0.12)
+                      HStack(spacing: 0) {
+                        ScreenRep(view: emu.screen)
+                        PartyPanel(party: emu.party, d: d).frame(width: d + 16)
+                      }
+                    }
+                  }
+                  else {
+                    VStack(spacing: 16) {
+                      Text("Pokémon Emerald").font(.title).foregroundColor(.white)
+                      Button("Load ROM (.zip or .gba)") { picking = true }.buttonStyle(.borderedProminent)
+                      if let e = emu.error { Text(e).foregroundColor(.red) }
+                    }
+                  }
+                }
+                .ignoresSafeArea().statusBarHidden(true).persistentSystemOverlays(.hidden)
+                .fileImporter(isPresented: $picking, allowedContentTypes: [.zip, .data]) { r in
+                  if case .success(let url) = r { emu.importROM(url) }
+                }
+                .onAppear { UIApplication.shared.isIdleTimerDisabled = true; emu.autoStart() }
+              }
+            }
+          }
+
+          struct ScreenRep: UIViewRepresentable {
+            let view: UIView
+            func makeUIView(context: Context) -> UIView { view }
+            func updateUIView(_ v: UIView, context: Context) {}
+          }
+
+          final class ScreenView: UIView {
+            override init(frame: CGRect) {
+              super.init(frame: frame)
+              layer.magnificationFilter = .linear
+              layer.minificationFilter = .linear
+              layer.contentsGravity = .resizeAspect
+              backgroundColor = .black
+            }
+            required init?(coder: NSCoder) { fatalError() }
+          }
+
+          final class Emu: ObservableObject {
+            @Published var running = false
+            @Published var error: String?
+            @Published var party: [Mon] = []
+            private var frame = 0
+            let screen = ScreenView()
+            private var link: CADisplayLink?
+            private let engine = AVAudioEngine()
+            private let lock = NSLock()
+            private var ring = [Float](); private var rp = 0
+            private var abuf = [Int16](repeating: 0, count: 4096)
+            private let cs = CGColorSpaceCreateDeviceRGB()
+            // 4x nearest-neighbour upscale, then smooth scaling to the screen = sharp, even pixels at any size
+            private lazy var hi = CGContext(data: nil, width: 960, height: 640, bitsPerComponent: 8, bytesPerRow: 0, space: cs, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+            private var docs: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
+
+            func autoStart() {
+              let p = docs.appendingPathComponent("game.gba")
+              if FileManager.default.fileExists(atPath: p.path) { start(p.path) }
+            }
+
+            func importROM(_ url: URL) {
+              let ok = url.startAccessingSecurityScopedResource()
+              defer { if ok { url.stopAccessingSecurityScopedResource() } }
+              let fm = FileManager.default
+              let dest = docs.appendingPathComponent("game.gba")
+              do {
+                var src = url
+                if url.pathExtension.lowercased() == "zip" {
+                  let tmp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                  try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+                  try fm.unzipItem(at: url, to: tmp)
+                  let found = fm.enumerator(at: tmp, includingPropertiesForKeys: nil)?
+                    .compactMap { $0 as? URL }.first { ["gba", "agb", "bin"].contains($0.pathExtension.lowercased()) }
+                  guard let f = found else { error = "No .gba file found in zip"; return }
+                  src = f
+                }
+                try? fm.removeItem(at: dest)
+                try fm.copyItem(at: src, to: dest)
+                start(dest.path)
+              } catch { self.error = error.localizedDescription }
+            }
+
+            func start(_ path: String) {
+              guard shim_load(path) != 0 else { error = "Could not load ROM"; return }
+              error = nil
+              let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!
+              let node = AVAudioSourceNode(format: fmt) { [weak self] _, _, frames, abl in
+                let b = UnsafeMutableAudioBufferListPointer(abl)
+                let l = b[0].mData!.assumingMemoryBound(to: Float.self)
+                let r = b[1].mData!.assumingMemoryBound(to: Float.self)
+                guard let s = self else { return noErr }
+                s.lock.lock(); defer { s.lock.unlock() }
+                for i in 0..<Int(frames) {
+                  if s.ring.count - s.rp >= 2 { l[i] = s.ring[s.rp]; r[i] = s.ring[s.rp + 1]; s.rp += 2 }
+                  else { l[i] = 0; r[i] = 0 }
+                }
+                return noErr
+              }
+              try? AVAudioSession.sharedInstance().setCategory(.playback)
+              try? AVAudioSession.sharedInstance().setActive(true)
+              engine.attach(node); engine.connect(node, to: engine.mainMixerNode, format: fmt)
+              try? engine.start()
+              link = CADisplayLink(target: self, selector: #selector(tick)); link?.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 60, preferred: 60)
+              link?.add(to: .main, forMode: .common)
+              running = true
+            }
+
+            @objc func tick() {
+              let n = Int(shim_frame(readKeys(), &abuf, 2048))
+              lock.lock()
+              if rp > 16384 { ring.removeFirst(rp); rp = 0 }
+              if ring.count - rp > 9600 { ring.removeAll(); rp = 0 }
+              for i in 0..<(n * 2) { ring.append(Float(abuf[i]) / 32768) }
+              lock.unlock()
+              frame += 1
+              if frame % 6 == 0 { let p = readParty(); if p != party { party = p } }
+              let w = Int(shim_width()), h = Int(shim_height())
+              if let ptr = shim_video(),
+                 let ctx = CGContext(data: UnsafeMutableRawPointer(mutating: ptr), width: w, height: h, bitsPerComponent: 8,
+                                     bytesPerRow: w * 4, space: cs, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) {
+                if let img = ctx.makeImage() {
+                  hi.interpolationQuality = .none
+                  hi.draw(img, in: CGRect(x: 0, y: 0, width: 960, height: 640))
+                  screen.layer.contents = hi.makeImage()
+                }
+              }
+            }
+
+            // GBA bits: A0 B1 Select2 Start3 Right4 Left5 Up6 Down7 R8 L9
+            // Apple's buttonA/B are positional (bottom/right), so right button -> GBA A matches both Xbox and Switch Pro.
+            func readKeys() -> UInt32 {
+              guard let g = GCController.controllers().first?.extendedGamepad else { return 0 }
+              var k: UInt32 = 0
+              if g.buttonB.isPressed { k |= 1 }
+              if g.buttonA.isPressed { k |= 2 }
+              if g.buttonOptions?.isPressed == true { k |= 4 }
+              if g.buttonMenu.isPressed { k |= 8 }
+              let x = g.leftThumbstick.xAxis.value, y = g.leftThumbstick.yAxis.value
+              if g.dpad.right.isPressed || x > 0.5 { k |= 16 }
+              if g.dpad.left.isPressed || x < -0.5 { k |= 32 }
+              if g.dpad.up.isPressed || y > 0.5 { k |= 64 }
+              if g.dpad.down.isPressed || y < -0.5 { k |= 128 }
+              if g.rightShoulder.isPressed { k |= 256 }
+              if g.leftShoulder.isPressed { k |= 512 }
+              return k
+            }
+          }
+          EOF
+          cat > Sources/Party.swift <<'EOF'
+          import SwiftUI
+
+          struct Mon: Identifiable, Equatable { let id: Int; let dex: Int; let hp: Int; let maxHP: Int; let level: Int }
+
+          // Emerald internal species 277...411 (Hoenn order) -> National Dex number
+          private let hoennToDex: [Int] = [252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,290,291,292,276,277,285,286,327,278,279,283,284,320,321,300,301,352,343,344,299,324,302,339,340,370,341,342,349,350,318,319,328,329,330,296,297,309,310,322,323,363,364,365,331,332,361,362,337,338,298,325,326,311,312,303,307,308,333,334,360,355,356,315,287,288,289,316,317,357,293,294,295,366,367,368,359,353,354,336,335,369,304,305,306,351,313,314,345,346,347,348,280,281,282,371,372,373,374,375,376,377,378,379,382,383,384,380,381,385,386,358]
+
+          func nationalDex(_ s: Int) -> Int? {
+            if s >= 1 && s <= 251 { return s }
+            if s >= 277 && s <= 411 { return hoennToDex[s - 277] }
+            return nil   // 0, unused slots, and eggs (412)
+          }
+
+          private let orders = ["GAEM","GAME","GEAM","GEMA","GMAE","GMEA","AGEM","AGME","AEGM","AEMG","AMGE","AMEG",
+                                "EGAM","EGMA","EAGM","EAMG","EMGA","EMAG","MGAE","MGEA","MAGE","MAEG","MEGA","MEAG"]
+
+          extension Emu {
+            // Emerald (USA): gPlayerPartyCount 0x020244E9, gPlayerParty 0x020244EC, 100 bytes per Pokemon
+            func readParty() -> [Mon] {
+              let n = Int(shim_read8(0x020244E9))
+              if n < 1 || n > 6 { return [] }
+              var out: [Mon] = []
+              for i in 0..<n {
+                let b = UInt32(0x020244EC + i * 100)
+                let pid = shim_read32(b), ot = shim_read32(b + 4)
+                let key = pid ^ ot
+                let order = Array(orders[Int(pid % 24)])
+                guard let g = order.firstIndex(of: "G") else { continue }
+                let word = shim_read32(b + 0x20 + UInt32(g * 12)) ^ key
+                guard let dex = nationalDex(Int(word & 0xFFFF)) else { continue }
+                out.append(Mon(id: i, dex: dex, hp: Int(shim_read16(b + 0x56)),
+                               maxHP: Int(shim_read16(b + 0x58)), level: Int(shim_read8(b + 0x54))))
+              }
+              return out
+            }
+          }
+
+          struct PartyPanel: View {
+            let party: [Mon]; let d: CGFloat
+            var body: some View {
+              VStack(spacing: d * 0.08) { ForEach(party) { Ring(m: $0, d: d) } }
+                .frame(maxHeight: .infinity).allowsHitTesting(false)
+            }
+          }
+
+          struct Ring: View {
+            let m: Mon; let d: CGFloat
+            var frac: CGFloat { min(1, CGFloat(m.hp) / CGFloat(max(m.maxHP, 1))) }
+            var color: Color { frac > 0.5 ? .green : (frac > 0.2 ? .orange : .red) }
+            var body: some View {
+              ZStack {
+                Circle().fill(Color.black.opacity(0.55))
+                Circle().stroke(Color.white.opacity(0.2), lineWidth: d * 0.09)
+                Circle().trim(from: 0, to: frac)
+                  .stroke(color, style: StrokeStyle(lineWidth: d * 0.09, lineCap: .round))
+                  .rotationEffect(.degrees(-90))
+                AsyncImage(url: URL(string: "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/versions/generation-vii/icons/\(m.dex).png")) { img in
+                  img.resizable().interpolation(.none).scaledToFit()
+                } placeholder: { Text("#\(m.dex)").font(.system(size: d * 0.22)).foregroundColor(.white) }
+                .padding(d * 0.14)
+              }.frame(width: d, height: d)
+            }
+          }
+          EOF
+      - name: Build mGBA for iOS
+        run: |
+          git clone --depth 1 --branch 0.10.3 https://github.com/mgba-emu/mgba mgba
+          cmake -S mgba -B build -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DBUILD_SHARED=OFF -DBUILD_STATIC=ON -DBUILD_QT=OFF -DBUILD_SDL=OFF -DBUILD_GL=OFF \
+            -DBUILD_GLES2=OFF -DBUILD_GLES3=OFF -DBUILD_LIBRETRO=OFF -DBUILD_PERF=OFF -DBUILD_TEST=OFF \
+            -DBUILD_EXAMPLE=OFF -DBUILD_HEADLESS=OFF -DBUILD_UPDATER=OFF -DM_CORE_GB=OFF -DM_CORE_GBA=ON \
+            -DUSE_FFMPEG=OFF -DUSE_PNG=OFF -DUSE_LIBZIP=OFF -DUSE_MINIZIP=OFF -DUSE_LZMA=OFF -DUSE_SQLITE3=OFF \
+            -DUSE_ELF=OFF -DUSE_EDITLINE=OFF -DUSE_EPOXY=OFF -DUSE_DISCORD_RPC=OFF -DUSE_DEBUGGERS=OFF \
+            -DENABLE_SCRIPTING=OFF -DENABLE_GDB_STUB=OFF
+          cmake --build build --target mgba -j4
+          ls -la build/*.a
+      - name: Build app
+        run: |
+          brew install xcodegen
+          xcodegen
+          xcodebuild -project PokeEmu.xcodeproj -scheme PokeEmu -sdk iphoneos -configuration Release \
+            -derivedDataPath out CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" build
+          mkdir Payload && cp -R out/Build/Products/Release-iphoneos/PokeEmu.app Payload/
+          zip -qr Emerald.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Emerald-ipa
+          path: Emerald.ipa
