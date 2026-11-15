@@ -115,10 +115,28 @@ jobs:
                   }
                 }
                 .ignoresSafeArea().statusBarHidden(true).persistentSystemOverlays(.hidden)
-                .fileImporter(isPresented: $picking, allowedContentTypes: [.zip, .data]) { r in
-                  if case .success(let url) = r { emu.importROM(url) }
+                .sheet(isPresented: $picking) {
+                  DocPicker { url in picking = false; emu.importROM(url) }.ignoresSafeArea()
                 }
                 .onAppear { UIApplication.shared.isIdleTimerDisabled = true; emu.autoStart() }
+              }
+            }
+          }
+
+          struct DocPicker: UIViewControllerRepresentable {
+            let onPick: (URL) -> Void
+            func makeCoordinator() -> Coord { Coord(onPick) }
+            func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+              let p = UIDocumentPickerViewController(forOpeningContentTypes: [.zip, .item], asCopy: true)
+              p.delegate = context.coordinator
+              return p
+            }
+            func updateUIViewController(_ c: UIDocumentPickerViewController, context: Context) {}
+            final class Coord: NSObject, UIDocumentPickerDelegate {
+              let onPick: (URL) -> Void
+              init(_ f: @escaping (URL) -> Void) { onPick = f }
+              func documentPicker(_ c: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+                if let u = urls.first { onPick(u) }
               }
             }
           }
