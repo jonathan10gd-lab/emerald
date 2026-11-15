@@ -59,7 +59,7 @@ jobs:
           int shim_load(const char *path) {
             core = mCoreFind(path); if (!core) return 0;
             core->init(core); mCoreInitConfig(core, NULL);
-            core->baseVideoSize(core, &W, &H);
+            core->currentVideoSize(core, &W, &H);
             core->setAudioBufferSize(core, 1024);
             vbuf = calloc(W * H, 4); core->setVideoBuffer(core, vbuf, W);
             if (!mCoreLoadFile(core, path)) return 0;
