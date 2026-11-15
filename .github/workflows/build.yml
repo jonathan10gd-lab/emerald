@@ -57,12 +57,17 @@ jobs:
           int shim_hunt_key(int mode, uint32_t dir, int f);
           void shim_hunt_restore(void);
           uint32_t shim_avg_color(void);
+          void shim_set_game(int kind);
+          void shim_unload(void);
+          int shim_state_save(const char *path);
+          int shim_state_load(const char *path);
           void shim_reload_save(void);
           EOF
           cat > Sources/shim.c <<'EOF'
           #include <mgba/core/core.h>
           #include <mgba/core/blip_buf.h>
           #include <stdlib.h>
+          #include <stdio.h>
           #include "Bridge.h"
           static struct mCore *core; static uint32_t *vbuf; static unsigned W, H;
           int shim_load(const char *path) {
@@ -82,18 +87,17 @@ jobs:
           unsigned shim_height(void) { return H; }
           const uint32_t *shim_video(void) { return vbuf; }
 
-          #define PARTY_ADDR 0x020244ECu
-          #define ENEMY_ADDR 0x02024744u
+          static uint32_t partyA = 0x020244ECu, enemyA = 0x02024744u;
           static void *S0, *TT; static uint32_t base[7], rngAddr, lastAddr, diagN; static volatile int progress;
           static uint32_t lcg(uint32_t s) { return s * 0x41C64E6Du + 0x6073u; }
           static void readMons(uint32_t *b) {
-            for (int i = 0; i < 6; i++) b[i] = core->busRead32(core, PARTY_ADDR + i * 100);
-            b[6] = core->busRead32(core, ENEMY_ADDR);
+            for (int i = 0; i < 6; i++) b[i] = core->busRead32(core, partyA + i * 100);
+            b[6] = core->busRead32(core, enemyA);
           }
           static int poll(void) {
             uint32_t c[7]; readMons(c);
             for (int i = 0; i < 7; i++)
-              if (c[i] != base[i] && c[i] != 0) { lastAddr = i < 6 ? PARTY_ADDR + i * 100 : ENEMY_ADDR; return 1; }
+              if (c[i] != base[i] && c[i] != 0) { lastAddr = i < 6 ? partyA + i * 100 : enemyA; return 1; }
             return 0;
           }
           int shim_hunt_poll(void) { return poll(); }
@@ -124,7 +128,7 @@ jobs:
               if (b == s) continue;
               for (int t = 1; t <= 4096; t++) {
                 s = lcg(s);
-                if (s == b) { uint32_t ad = 0x03000000u + i * 4; if (!rngAddr || ad == 0x03005D80u) rngAddr = ad; break; }
+                if (s == b) { uint32_t ad = 0x03000000u + i * 4; if (!rngAddr || ad == 0x03005D80u || ad == 0x03005000u) rngAddr = ad; break; }
               }
             }
             core->loadState(core, S0);
@@ -173,6 +177,32 @@ jobs:
             }
             core->loadState(core, S0);
             return -4;
+          }
+          void shim_set_game(int kind) {   // 0 = Emerald, 1 = FireRed / LeafGreen
+            if (kind == 0) { partyA = 0x020244ECu; enemyA = 0x02024744u; }
+            else { partyA = 0x02024284u; enemyA = 0x0202402Cu; }
+          }
+          void shim_unload(void) {
+            if (!core) return;
+            core->unloadROM(core);
+            mCoreConfigDeinit(&core->config);
+            core->deinit(core);
+            core = NULL; free(vbuf); vbuf = NULL; free(S0); S0 = NULL; free(TT); TT = NULL;
+          }
+          int shim_state_save(const char *path) {
+            if (!core) return 0;
+            size_t n = core->stateSize(core); void *b = malloc(n);
+            int ok = core->saveState(core, b);
+            if (ok) { FILE *f = fopen(path, "wb"); ok = f && fwrite(b, 1, n, f) == n; if (f) fclose(f); }
+            free(b); return ok;
+          }
+          int shim_state_load(const char *path) {
+            if (!core) return 0;
+            size_t n = core->stateSize(core); void *b = malloc(n);
+            FILE *f = fopen(path, "rb"); int ok = f && fread(b, 1, n, f) == n;
+            if (f) fclose(f);
+            if (ok) ok = core->loadState(core, b);
+            free(b); return ok;
           }
           uint32_t shim_avg_color(void) {
             if (!vbuf) return 0;
@@ -229,6 +259,10 @@ jobs:
                       Button("Export save") { if let u = emu.exportSave() { share = ShareItem(url: u) } }.buttonStyle(.bordered)
                       Toggle("Ambient background (average screen color)", isOn: $emu.ambient)
                         .foregroundColor(.white).frame(width: 380)
+                      Toggle("Link PC boxes between games", isOn: $emu.linkBoxes)
+                        .foregroundColor(.white).frame(width: 380)
+                      Toggle("Controller rumble", isOn: $emu.rumbleOn)
+                        .foregroundColor(.white).frame(width: 380)
                       if let e = emu.error { Text(e).foregroundColor(.red) }
                     }
                   }
@@ -248,6 +282,18 @@ jobs:
                       Button("Export save") { if let u = emu.exportSave() { share = ShareItem(url: u) } }
                       Button("Import save") { pickingSav = true }
                       Toggle("Ambient background", isOn: $emu.ambient)
+                      Divider()
+                      ForEach(emu.installedSlots.filter { $0 != emu.slot }, id: \.self) { g in
+                        Button("Switch to \(emu.displayName(g))") { emu.switchTo(g) }
+                      }
+                      Button("Add / replace ROM…") { picking = true }
+                      Toggle("Controller rumble", isOn: $emu.rumbleOn)
+                      Button("Test rumble") { emu.rumble.hit(intensity: 1, duration: 0.5) }
+                      Toggle("Link PC boxes between games", isOn: $emu.linkBoxes)
+                      Menu("Save states") {
+                        ForEach(1..<4) { n in Button("Save to slot \(n)") { emu.saveState(n) } }
+                        ForEach(1..<4) { n in Button("Load slot \(n)") { emu.loadState(n) } }
+                      }
                     } label: { Text("✦ Menu") }.font(.caption).padding(6)
                       .background(.black.opacity(0.5)).foregroundColor(.yellow).cornerRadius(8).padding(12)
                   }
@@ -330,6 +376,30 @@ jobs:
             var huntMode: Int32 = 0
             var huntDir: UInt32 = 0
             func resetAudio() { lock.lock(); ring.removeAll(); rp = 0; lock.unlock() }
+            @Published var slot = ""
+            @Published var linkBoxes = UserDefaults.standard.bool(forKey: "linkBoxes") { didSet { UserDefaults.standard.set(linkBoxes, forKey: "linkBoxes") } }
+            var partyBase: UInt32 = 0x020244EC
+            var partyCountAddr: UInt32 = 0x020244E9
+            var turbo = false
+            let rumble = Rumble()
+            var lastHP: [UInt32: Int] = [:]
+            var enemyBase: UInt32 = 0x02024744
+            @Published var rumbleOn = (UserDefaults.standard.object(forKey: "rumble") as? Bool) ?? true { didSet { UserDefaults.standard.set(rumbleOn, forKey: "rumble") } }
+            var node: AVAudioSourceNode?
+            func stop() {
+              link?.invalidate(); link = nil
+              engine.stop()
+              if let n = node { engine.detach(n); node = nil }
+              shim_unload()
+              running = false; party = []; mashing = false; resetAudio()
+            }
+            func startSlot(_ s: String) {
+              slot = s; UserDefaults.standard.set(s, forKey: "lastSlot")
+              if s == "emerald" { partyBase = 0x020244EC; partyCountAddr = 0x020244E9; enemyBase = 0x02024744 }
+              else { partyBase = 0x02024284; partyCountAddr = 0x02024029; enemyBase = 0x0202402C }
+              shim_set_game(s == "emerald" ? 0 : 1)
+              start(docs.appendingPathComponent(s + ".gba").path)
+            }
             let screen = ScreenView()
             private var link: CADisplayLink?
             private let engine = AVAudioEngine()
@@ -342,8 +412,15 @@ jobs:
             var docs: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0] }
 
             func autoStart() {
-              let p = docs.appendingPathComponent("game.gba")
-              if FileManager.default.fileExists(atPath: p.path) { start(p.path) }
+              let fm = FileManager.default
+              let old = docs.appendingPathComponent("game.gba")
+              if fm.fileExists(atPath: old.path), let n = romSlot(old) {   // migrate from the single-game version
+                try? fm.moveItem(at: old, to: docs.appendingPathComponent(n + ".gba"))
+                try? fm.moveItem(at: docs.appendingPathComponent("game.sav"), to: docs.appendingPathComponent(n + ".sav"))
+              }
+              let last = UserDefaults.standard.string(forKey: "lastSlot") ?? ""
+              let s = installedSlots.contains(last) ? last : (installedSlots.first ?? "")
+              if !s.isEmpty { startSlot(s) }
             }
 
             func importROM(_ url: URL) {
@@ -362,9 +439,11 @@ jobs:
                   guard let f = found else { error = "No .gba file found in zip"; return }
                   src = f
                 }
-                try? fm.removeItem(at: dest)
-                try fm.copyItem(at: src, to: dest)
-                start(dest.path)
+                guard let name = romSlot(src) else { error = "Not a Pokémon Emerald, FireRed or LeafGreen ROM"; return }
+                let target = docs.appendingPathComponent(name + ".gba")
+                try? fm.removeItem(at: target)
+                try fm.copyItem(at: src, to: target)
+                switchTo(name)
               } catch { self.error = error.localizedDescription }
             }
 
@@ -387,6 +466,7 @@ jobs:
               try? AVAudioSession.sharedInstance().setCategory(.playback)
               try? AVAudioSession.sharedInstance().setActive(true)
               engine.attach(node); engine.connect(node, to: engine.mainMixerNode, format: fmt)
+              self.node = node
               try? engine.start()
               link = CADisplayLink(target: self, selector: #selector(tick)); link?.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 60, preferred: 60)
               link?.add(to: .main, forMode: .common)
@@ -400,8 +480,9 @@ jobs:
               var k = readKeys()
               if mashing { k = UInt32(shim_hunt_key(huntMode, huntDir, Int32(mashF))); mashF += 1 }
               var n = Int(shim_frame(k, &abuf, 2048))
-              if speed > 1 && !mashing {   // fast-forward: extra frames per tick, no audio
-                for _ in 1..<speed { _ = shim_frame(readKeys(), &abuf, 2048) }
+              let sp = turbo ? max(speed, 4) : speed
+              if sp > 1 && !mashing {   // fast-forward: extra frames per tick, no audio
+                for _ in 1..<sp { _ = shim_frame(readKeys(), &abuf, 2048) }
                 n = 0
               }
               if mashing && (shim_hunt_poll() != 0 || mashF >= Int(shim_hunt_cap(huntMode))) {
@@ -414,7 +495,7 @@ jobs:
               for i in 0..<(n * 2) { ring.append(Float(abuf[i]) / 32768) }
               lock.unlock()
               frame += 1
-              if frame % 6 == 0 { let p = readParty(); if p != party { party = p } }
+              if frame % 6 == 0 { let p = readParty(); if p != party { party = p }; if rumbleOn { checkDamage(p) } }
               if ambient && frame % 6 == 3 { updateAvg() }
               let w = Int(shim_width()), h = Int(shim_height())
               if let ptr = shim_video(),
@@ -451,7 +532,7 @@ jobs:
           cat > Sources/Party.swift <<'EOF'
           import SwiftUI
 
-          struct Mon: Identifiable, Equatable { let id: Int; let dex: Int; let hp: Int; let maxHP: Int; let level: Int; let shiny: Bool }
+          struct Mon: Identifiable, Equatable { let id: Int; let dex: Int; let hp: Int; let maxHP: Int; let level: Int; let shiny: Bool; let pid: UInt32 }
 
           // Emerald internal species 277...411 (Hoenn order) -> National Dex number
           private let hoennToDex: [Int] = [252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,290,291,292,276,277,285,286,327,278,279,283,284,320,321,300,301,352,343,344,299,324,302,339,340,370,341,342,349,350,318,319,328,329,330,296,297,309,310,322,323,363,364,365,331,332,361,362,337,338,298,325,326,311,312,303,307,308,333,334,360,355,356,315,287,288,289,316,317,357,293,294,295,366,367,368,359,353,354,336,335,369,304,305,306,351,313,314,345,346,347,348,280,281,282,371,372,373,374,375,376,377,378,379,382,383,384,380,381,385,386,358]
@@ -468,11 +549,11 @@ jobs:
           extension Emu {
             // Emerald (USA): gPlayerPartyCount 0x020244E9, gPlayerParty 0x020244EC, 100 bytes per Pokemon
             func readParty() -> [Mon] {
-              let n = Int(shim_read8(0x020244E9))
+              let n = Int(shim_read8(partyCountAddr))
               if n < 1 || n > 6 { return [] }
               var out: [Mon] = []
               for i in 0..<n {
-                let b = UInt32(0x020244EC + i * 100)
+                let b = partyBase + UInt32(i * 100)
                 let pid = shim_read32(b), ot = shim_read32(b + 4)
                 let key = pid ^ ot
                 let order = Array(orders[Int(pid % 24)])
@@ -481,7 +562,7 @@ jobs:
                 guard let dex = nationalDex(Int(word & 0xFFFF)) else { continue }
                 out.append(Mon(id: i, dex: dex, hp: Int(shim_read16(b + 0x56)),
                                maxHP: Int(shim_read16(b + 0x58)), level: Int(shim_read8(b + 0x54)),
-                               shiny: ((ot >> 16) ^ (ot & 0xFFFF) ^ (pid >> 16) ^ (pid & 0xFFFF)) < 8))
+                               shiny: ((ot >> 16) ^ (ot & 0xFFFF) ^ (pid >> 16) ^ (pid & 0xFFFF)) < 8, pid: pid))
               }
               return out
             }
@@ -532,7 +613,8 @@ jobs:
 
             // Y = static / gift hunt.  X = wild hunt in the direction held on the d-pad / left stick.
             func pollHuntButtons() {
-              guard let g = GCController.controllers().first?.extendedGamepad else { return }
+              guard let g = GCController.controllers().first?.extendedGamepad else { turbo = false; return }
+              turbo = g.rightTrigger.isPressed
               let x = g.buttonX.isPressed, y = g.buttonY.isPressed
               if x && !xDown { startHunt(mode: 1, dir: dirBits(g)) }
               if y && !yDown { startHunt(mode: 0, dir: 0) }
@@ -600,7 +682,7 @@ jobs:
           }
 
           extension Emu {
-            var savURL: URL { docs.appendingPathComponent("game.sav") }
+            var savURL: URL { docs.appendingPathComponent(slot + ".sav") }
 
             func flash(_ m: String) {
               huntMsg = m
@@ -611,7 +693,7 @@ jobs:
             func exportSave() -> URL? {
               let fm = FileManager.default
               guard fm.fileExists(atPath: savURL.path) else { flash("No save file yet. Save in the game first."); return nil }
-              let dst = fm.temporaryDirectory.appendingPathComponent("Pokemon Emerald.sav")
+              let dst = fm.temporaryDirectory.appendingPathComponent("Pokemon \(displayName(slot)).sav")
               try? fm.removeItem(at: dst)
               do { try fm.copyItem(at: savURL, to: dst); return dst } catch { flash("Couldn't export: \(error.localizedDescription)"); return nil }
             }
@@ -623,7 +705,7 @@ jobs:
               guard let data = try? Data(contentsOf: url) else { flash("Couldn't read that file."); return }
               guard data.count >= 131072 else { flash("That doesn't look like an Emerald save (needs 128 KB)."); return }
               if fm.fileExists(atPath: savURL.path) {   // keep a backup of the current save
-                let bak = docs.appendingPathComponent("game.sav.bak")
+                let bak = docs.appendingPathComponent(slot + ".sav.bak")
                 try? fm.removeItem(at: bak); try? fm.copyItem(at: savURL, to: bak)
               }
               do { try data.prefix(131072).write(to: savURL) } catch { flash("Couldn't import: \(error.localizedDescription)"); return }
@@ -641,6 +723,209 @@ jobs:
 
             var avgColor: Color {
               Color(red: Double((avgRGB >> 16) & 255) / 255, green: Double((avgRGB >> 8) & 255) / 255, blue: Double(avgRGB & 255) / 255)
+            }
+          }
+          EOF
+          cat > Sources/Link.swift <<'EOF'
+          import Foundation
+
+          // Gen 3 save layout: 2 save slots x 14 sectors x 4096 bytes. Sectors 5...13 hold the PC (33744 bytes).
+          enum GBASave {
+            static let pcLen = 33744
+            static let chunks = [Int](repeating: 3968, count: 8) + [2000]
+
+            static func u16(_ d: Data, _ o: Int) -> UInt16 { UInt16(d[o]) | UInt16(d[o + 1]) << 8 }
+            static func u32(_ d: Data, _ o: Int) -> UInt32 {
+              UInt32(d[o]) | UInt32(d[o + 1]) << 8 | UInt32(d[o + 2]) << 16 | UInt32(d[o + 3]) << 24
+            }
+
+            static func checksum(_ d: Data, _ base: Int, _ len: Int) -> UInt16 {
+              var sum: UInt32 = 0, i = 0
+              while i < len { sum = sum &+ u32(d, base + i); i += 4 }
+              return UInt16(truncatingIfNeeded: (sum >> 16) &+ sum)
+            }
+
+            // sector id -> file offset, for the newest valid save slot
+            static func activeSectors(_ d: Data) -> [Int: Int]? {
+              guard d.count >= 131072 else { return nil }
+              var best: (counter: UInt32, map: [Int: Int])?
+              for slot in 0..<2 {
+                var map: [Int: Int] = [:], counter: UInt32 = 0, valid = true
+                for s in 0..<14 {
+                  let base = (slot * 14 + s) * 4096
+                  guard u32(d, base + 0xFF8) == 0x08012025 else { valid = false; break }
+                  map[Int(u16(d, base + 0xFF4))] = base
+                  counter = u32(d, base + 0xFFC)
+                }
+                if valid && map.count == 14 && (best == nil || counter > best!.counter) { best = (counter, map) }
+              }
+              return best?.map
+            }
+
+            static func readPC(_ d: Data) -> Data? {
+              guard let m = activeSectors(d) else { return nil }
+              var out = Data()
+              for (i, id) in (5...13).enumerated() {
+                guard let base = m[id] else { return nil }
+                let len = chunks[i]
+                if checksum(d, base, len) != u16(d, base + 0xFF6) { return nil }
+                out.append(d.subdata(in: base..<(base + len)))
+              }
+              return out
+            }
+
+            static func writePC(_ pc: Data, into d: Data) -> Data? {
+              guard pc.count == pcLen, let m = activeSectors(d) else { return nil }
+              var out = d, pos = 0
+              for (i, id) in (5...13).enumerated() {
+                guard let base = m[id] else { return nil }
+                let len = chunks[i]
+                out.replaceSubrange(base..<(base + len), with: pc.subdata(in: pos..<(pos + len)))
+                pos += len
+                let cs = checksum(out, base, len)
+                out[base + 0xFF6] = UInt8(cs & 0xFF); out[base + 0xFF7] = UInt8(cs >> 8)
+              }
+              return out
+            }
+          }
+
+          enum PCBox {
+            // PokemonStorage: 1 byte current box (+3 pad), then 14 boxes x 30 slots x 80 bytes
+            static func key(_ d: Data, _ o: Int) -> UInt64 { UInt64(GBASave.u32(d, o)) | UInt64(GBASave.u32(d, o + 4)) << 32 }
+            static func occupied(_ d: Data, _ i: Int) -> Bool { key(d, 4 + i * 80) != 0 }
+
+            // First-time link: keep everything from `base`, then add the other game's Pokemon into free slots.
+            static func merge(base: Data, extra: Data) -> Data {
+              var out = base, seen = Set<UInt64>()
+              for i in 0..<420 where occupied(base, i) { seen.insert(key(base, 4 + i * 80)) }
+              var free = (0..<420).filter { !occupied(base, $0) }.makeIterator()
+              for i in 0..<420 where occupied(extra, i) {
+                let k = key(extra, 4 + i * 80)
+                if seen.contains(k) { continue }
+                guard let f = free.next() else { break }
+                out.replaceSubrange((4 + f * 80)..<(4 + f * 80 + 80), with: extra.subdata(in: (4 + i * 80)..<(4 + i * 80 + 80)))
+                seen.insert(k)
+              }
+              return out
+            }
+          }
+
+          extension Emu {
+            func displayName(_ s: String) -> String { ["emerald": "Emerald", "firered": "FireRed", "leafgreen": "LeafGreen"][s] ?? s }
+
+            var installedSlots: [String] {
+              ["emerald", "firered", "leafgreen"].filter { FileManager.default.fileExists(atPath: docs.appendingPathComponent($0 + ".gba").path) }
+            }
+
+            // Identify a ROM by its game code in the header (BPE = Emerald, BPR = FireRed, BPG = LeafGreen).
+            func romSlot(_ url: URL) -> String? {
+              guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+              defer { try? h.close() }
+              try? h.seek(toOffset: 0xAC)
+              guard let d = try? h.read(upToCount: 4), let code = String(data: d, encoding: .ascii) else { return nil }
+              if code.hasPrefix("BPE") { return "emerald" }
+              if code.hasPrefix("BPR") { return "firered" }
+              if code.hasPrefix("BPG") { return "leafgreen" }
+              return nil
+            }
+
+            func switchTo(_ new: String) {
+              guard !hunting else { return }
+              let old = slot
+              if running { stop() }   // closes the game so its save file is fully written
+              if linkBoxes, !old.isEmpty, old != new { transferBoxes(from: old, to: new) }
+              startSlot(new)
+            }
+
+            func transferBoxes(from a: String, to b: String) {
+              let fm = FileManager.default
+              let aURL = docs.appendingPathComponent(a + ".sav"), bURL = docs.appendingPathComponent(b + ".sav")
+              let master = docs.appendingPathComponent("linked_boxes.bin")
+              guard let ad = try? Data(contentsOf: aURL), let srcPC = GBASave.readPC(ad) else {
+                flash("Boxes not linked: couldn't read the \(displayName(a)) save. Save in the game first."); return
+              }
+              guard fm.fileExists(atPath: bURL.path), let bd = try? Data(contentsOf: bURL) else {
+                try? srcPC.write(to: master)
+                flash("\(displayName(b)) has no save yet. Start a new game, save once, then switch again to link."); return
+              }
+              var pc = srcPC
+              if !fm.fileExists(atPath: master.path), let tpc = GBASave.readPC(bd) { pc = PCBox.merge(base: srcPC, extra: tpc) }
+              guard let out = GBASave.writePC(pc, into: bd) else { flash("Boxes not linked: the \(displayName(b)) save looks unreadable."); return }
+              let backup = docs.appendingPathComponent(b + ".sav.prelink")
+              try? fm.removeItem(at: backup); try? fm.copyItem(at: bURL, to: backup)
+              do { try out.write(to: bURL); try pc.write(to: master); flash("PC boxes linked: \(displayName(a)) → \(displayName(b))") }
+              catch { flash("Link failed: \(error.localizedDescription)") }
+            }
+
+            func saveState(_ n: Int) {
+              guard running, !hunting else { return }
+              flash(shim_state_save(docs.appendingPathComponent("\(slot).state\(n)").path) != 0 ? "State \(n) saved" : "Couldn't save state")
+            }
+
+            func loadState(_ n: Int) {
+              guard running, !hunting else { return }
+              let p = docs.appendingPathComponent("\(slot).state\(n)").path
+              if !FileManager.default.fileExists(atPath: p) { flash("State \(n) is empty"); return }
+              if shim_state_load(p) != 0 { resetAudio(); flash("State \(n) loaded") } else { flash("Couldn't load state") }
+            }
+          }
+          EOF
+          cat > Sources/Haptics.swift <<'EOF'
+          import Foundation
+          import CoreHaptics
+          import GameController
+
+          final class Rumble {
+            private var engine: CHHapticEngine?
+            private var owner: ObjectIdentifier?
+
+            private func ensure() -> CHHapticEngine? {
+              guard let c = GCController.controllers().first, let h = c.haptics else { engine = nil; owner = nil; return nil }
+              let id = ObjectIdentifier(c)
+              if engine == nil || owner != id {
+                engine = h.createEngine(withLocality: .default)
+                owner = id
+                engine?.stoppedHandler = { [weak self] _ in self?.engine = nil }
+                engine?.resetHandler = { [weak self] in try? self?.engine?.start() }
+                try? engine?.start()
+              }
+              return engine
+            }
+
+            // intensity 0...1, duration in seconds
+            func hit(intensity: Float, duration: TimeInterval) {
+              guard let e = ensure() else { return }
+              do {
+                let i = CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity)
+                let sh = CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.3 + 0.5 * intensity)
+                let thump = CHHapticEvent(eventType: .hapticTransient, parameters: [i, sh], relativeTime: 0)
+                let rumble = CHHapticEvent(eventType: .hapticContinuous, parameters: [i, sh], relativeTime: 0, duration: duration)
+                let pattern = try CHHapticPattern(events: [thump, rumble], parameters: [])
+                try e.makePlayer(with: pattern).start(atTime: CHHapticTimeImmediate)
+              } catch {}
+            }
+          }
+
+          extension Emu {
+            // Shake scales with the damage dealt, as a fraction of the target's max HP.
+            // Works for hits you land and hits you take, whatever move caused them.
+            func checkDamage(_ mons: [Mon]) {
+              var worst = 0.0
+              func note(_ pid: UInt32, _ hp: Int, _ maxHP: Int) {
+                guard pid != 0, maxHP > 0, hp <= maxHP else { return }
+                if let prev = lastHP[pid], hp < prev { worst = max(worst, Double(prev - hp) / Double(maxHP)) }
+                lastHP[pid] = hp
+              }
+              for m in mons { note(m.pid, m.hp, m.maxHP) }
+              for i in 0..<2 {   // enemy slots (two for double battles)
+                let b = enemyBase + UInt32(i * 100)
+                let pid = shim_read32(b), mx = Int(shim_read16(b + 0x58))
+                if pid != 0 && mx > 0 && mx < 1000 { note(pid, Int(shim_read16(b + 0x56)), mx) }
+              }
+              if worst > 0 {
+                let f = min(1.0, worst)
+                rumble.hit(intensity: Float(min(1.0, 0.2 + f.squareRoot() * 0.9)), duration: 0.12 + f * 0.55)
+              }
             }
           }
           EOF
