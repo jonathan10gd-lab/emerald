@@ -51,6 +51,7 @@ jobs:
           uint32_t shim_read32(uint32_t addr);
           int shim_hunt_run(int mode, uint32_t dir, int maxD);
           int shim_hunt_progress(void);
+          int shim_hunt_poll(void);
           uint32_t shim_hunt_diag(int i);
           int shim_hunt_cap(int mode);
           int shim_hunt_key(int mode, uint32_t dir, int f);
