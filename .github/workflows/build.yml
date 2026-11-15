@@ -49,6 +49,12 @@ jobs:
           uint8_t shim_read8(uint32_t addr);
           uint16_t shim_read16(uint32_t addr);
           uint32_t shim_read32(uint32_t addr);
+          int shim_hunt_prepare(void);
+          int shim_hunt_sim(int d, uint32_t *pid, uint32_t *ot, uint32_t *rngPrev);
+          int shim_hunt_predict(uint32_t pid, uint32_t ot, uint32_t rngPrev, int maxD, int *out, int maxOut);
+          void shim_hunt_seek(int d);
+          void shim_hunt_restore(void);
+          int shim_hunt_poll(void);
           EOF
           cat > Sources/shim.c <<'EOF'
           #include <mgba/core/core.h>
@@ -72,6 +78,80 @@ jobs:
           unsigned shim_width(void) { return W; }
           unsigned shim_height(void) { return H; }
           const uint32_t *shim_video(void) { return vbuf; }
+
+          #define PARTY_ADDR 0x020244ECu
+          #define ENEMY_ADDR 0x02024744u
+          static void *S0; static uint32_t base[7], rngAddr, lastAddr; static int rngK;
+          static uint32_t lcg(uint32_t s) { return s * 0x41C64E6Du + 0x6073u; }
+          static void readMons(uint32_t *b) {
+            for (int i = 0; i < 6; i++) b[i] = core->busRead32(core, PARTY_ADDR + i * 100);
+            b[6] = core->busRead32(core, ENEMY_ADDR);
+          }
+          int shim_hunt_poll(void) {
+            uint32_t c[7]; readMons(c);
+            for (int i = 0; i < 7; i++)
+              if (c[i] != base[i] && c[i] != 0) { lastAddr = i < 6 ? PARTY_ADDR + i * 100 : ENEMY_ADDR; return 1; }
+            return 0;
+          }
+          void shim_hunt_restore(void) { if (S0) core->loadState(core, S0); }
+          int shim_hunt_prepare(void) {
+            static uint32_t a[8192];
+            free(S0); S0 = malloc(core->stateSize(core));
+            if (!core->saveState(core, S0)) return 0;
+            readMons(base);
+            for (int i = 0; i < 8192; i++) a[i] = core->busRead32(core, 0x03000000u + i * 4);
+            for (int f = 0; f < 8; f++) { core->setKeys(core, 0); core->runFrame(core); }
+            rngAddr = 0; rngK = 0;
+            for (int i = 0; i < 8192; i++) {
+              uint32_t b = core->busRead32(core, 0x03000000u + i * 4), s = a[i];
+              if (b == s) continue;
+              for (int t = 1; t <= 64; t++) {
+                s = lcg(s);
+                if (s == b) {
+                  uint32_t ad = 0x03000000u + i * 4;
+                  if (t % 8 == 0 && (!rngAddr || ad == 0x03005D80u)) { rngAddr = ad; rngK = t / 8; }
+                  break;
+                }
+              }
+            }
+            core->loadState(core, S0);
+            return rngAddr != 0;
+          }
+          void shim_hunt_seek(int d) {
+            core->loadState(core, S0);
+            for (int i = 0; i < d; i++) { core->setKeys(core, 0); core->runFrame(core); }
+          }
+          // Wait d frames, then mash A (4 frames down, 4 up) until a new Pokemon appears in memory.
+          int shim_hunt_sim(int d, uint32_t *pid, uint32_t *ot, uint32_t *rngPrev) {
+            shim_hunt_seek(d);
+            for (int f = 0; f < 900; f++) {
+              uint32_t prev = core->busRead32(core, rngAddr);
+              core->setKeys(core, (f % 8) < 4 ? 1 : 0); core->runFrame(core);
+              if (shim_hunt_poll()) {
+                *pid = core->busRead32(core, lastAddr); *ot = core->busRead32(core, lastAddr + 4); *rngPrev = prev;
+                return 1;
+              }
+            }
+            return 0;
+          }
+          // Find where the PID sits in the RNG sequence, then list the delays d that give a shiny.
+          int shim_hunt_predict(uint32_t pid, uint32_t ot, uint32_t rp, int maxD, int *out, int maxOut) {
+            uint32_t lo = pid & 0xFFFF, hi = pid >> 16, tsid = (ot >> 16) ^ (ot & 0xFFFF), t = rp;
+            int found = 0;
+            for (int n = 0; n < 4000; n++) {
+              uint32_t a = lcg(t), b = lcg(a), f = a >> 16, s = b >> 16;
+              if ((f == lo && s == hi) || (f == hi && s == lo)) { found = 1; break; }
+              t = a;
+            }
+            if (!found) return -1;
+            int cnt = 0;
+            for (int d = 0; d <= maxD && cnt < maxOut; d++) {
+              uint32_t a = lcg(t), b = lcg(a);
+              if (((tsid ^ (a >> 16) ^ (b >> 16)) & 0xFFFF) < 8) out[cnt++] = d;
+              for (int j = 0; j < rngK; j++) t = lcg(t);
+            }
+            return cnt;
+          }
           uint8_t shim_read8(uint32_t a) { return core->busRead8(core, a); }
           uint16_t shim_read16(uint32_t a) { return core->busRead16(core, a); }
           uint32_t shim_read32(uint32_t a) { return core->busRead32(core, a); }
@@ -112,6 +192,18 @@ jobs:
                       Button("Load ROM (.zip or .gba)") { picking = true }.buttonStyle(.borderedProminent)
                       if let e = emu.error { Text(e).foregroundColor(.red) }
                     }
+                  }
+                }
+                .overlay(alignment: .topLeading) {
+                  if emu.running {
+                    Button("✦ Hunt") { emu.startHunt() }.font(.caption).padding(6)
+                      .background(.black.opacity(0.5)).foregroundColor(.yellow).cornerRadius(8).padding(12)
+                  }
+                }
+                .overlay(alignment: .top) {
+                  if let m = emu.huntMsg {
+                    Text(m).font(.callout).padding(8).background(.black.opacity(0.75))
+                      .foregroundColor(.yellow).cornerRadius(8).padding(.top, 12)
                   }
                 }
                 .ignoresSafeArea().statusBarHidden(true).persistentSystemOverlays(.hidden)
@@ -163,6 +255,12 @@ jobs:
             @Published var error: String?
             @Published var party: [Mon] = []
             private var frame = 0
+            @Published var hunting = false
+            @Published var huntMsg: String?
+            var mashing = false
+            var mashF = 0
+            var r3Down = false
+            func resetAudio() { lock.lock(); ring.removeAll(); rp = 0; lock.unlock() }
             let screen = ScreenView()
             private var link: CADisplayLink?
             private let engine = AVAudioEngine()
@@ -227,7 +325,18 @@ jobs:
             }
 
             @objc func tick() {
-              let n = Int(shim_frame(readKeys(), &abuf, 2048))
+              if hunting { return }
+              let r3 = GCController.controllers().first?.extendedGamepad?.rightThumbstickButton?.isPressed ?? false
+              if r3 && !r3Down && !mashing { startHunt() }
+              r3Down = r3
+              if hunting { return }
+              var k = readKeys()
+              if mashing { k = (mashF % 8) < 4 ? 1 : 0; mashF += 1 }
+              let n = Int(shim_frame(k, &abuf, 2048))
+              if mashing && (shim_hunt_poll() != 0 || mashF >= 900) {
+                mashing = false; huntMsg = "Done!"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self.huntMsg = nil }
+              }
               lock.lock()
               if rp > 16384 { ring.removeFirst(rp); rp = 0 }
               if ring.count - rp > 9600 { ring.removeAll(); rp = 0 }
@@ -270,7 +379,7 @@ jobs:
           cat > Sources/Party.swift <<'EOF'
           import SwiftUI
 
-          struct Mon: Identifiable, Equatable { let id: Int; let dex: Int; let hp: Int; let maxHP: Int; let level: Int }
+          struct Mon: Identifiable, Equatable { let id: Int; let dex: Int; let hp: Int; let maxHP: Int; let level: Int; let shiny: Bool }
 
           // Emerald internal species 277...411 (Hoenn order) -> National Dex number
           private let hoennToDex: [Int] = [252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,290,291,292,276,277,285,286,327,278,279,283,284,320,321,300,301,352,343,344,299,324,302,339,340,370,341,342,349,350,318,319,328,329,330,296,297,309,310,322,323,363,364,365,331,332,361,362,337,338,298,325,326,311,312,303,307,308,333,334,360,355,356,315,287,288,289,316,317,357,293,294,295,366,367,368,359,353,354,336,335,369,304,305,306,351,313,314,345,346,347,348,280,281,282,371,372,373,374,375,376,377,378,379,382,383,384,380,381,385,386,358]
@@ -299,7 +408,8 @@ jobs:
                 let word = shim_read32(b + 0x20 + UInt32(g * 12)) ^ key
                 guard let dex = nationalDex(Int(word & 0xFFFF)) else { continue }
                 out.append(Mon(id: i, dex: dex, hp: Int(shim_read16(b + 0x56)),
-                               maxHP: Int(shim_read16(b + 0x58)), level: Int(shim_read8(b + 0x54))))
+                               maxHP: Int(shim_read16(b + 0x58)), level: Int(shim_read8(b + 0x54)),
+                               shiny: ((ot >> 16) ^ (ot & 0xFFFF) ^ (pid >> 16) ^ (pid & 0xFFFF)) < 8))
               }
               return out
             }
@@ -329,6 +439,52 @@ jobs:
                 } placeholder: { Text("#\(m.dex)").font(.system(size: d * 0.22)).foregroundColor(.white) }
                 .padding(d * 0.14)
               }.frame(width: d, height: d)
+              .overlay(alignment: .topTrailing) { if m.shiny { Text("✦").font(.system(size: d * 0.3)).foregroundColor(.yellow) } }
+            }
+          }
+          EOF
+          cat > Sources/Hunt.swift <<'EOF'
+          import Foundation
+
+          extension Emu {
+            func startHunt() {
+              guard running, !hunting, !mashing else { return }
+              hunting = true; huntMsg = "Shiny hunt: scanning…"
+              DispatchQueue.global(qos: .userInitiated).async {
+                let r = self.runHunt()
+                DispatchQueue.main.async {
+                  self.resetAudio()
+                  self.hunting = false
+                  self.huntMsg = r.msg
+                  if r.ok { self.mashing = true; self.mashF = 0 }
+                  else { DispatchQueue.main.asyncAfter(deadline: .now() + 6) { self.huntMsg = nil } }
+                }
+              }
+            }
+
+            // Stand facing the Pokemon / ball / NPC, then trigger. Mashes A automatically at the right frame.
+            private func runHunt() -> (ok: Bool, msg: String) {
+              if shim_hunt_prepare() == 0 { return (false, "Can't track the game's RNG here. Stand still and try again.") }
+              var pid: UInt32 = 0, ot: UInt32 = 0, rp: UInt32 = 0
+              if shim_hunt_sim(0, &pid, &ot, &rp) == 0 {
+                shim_hunt_restore()
+                return (false, "Nothing appeared after pressing A. Face the Pokémon or ball and try again.")
+              }
+              var cands = [Int32](repeating: 0, count: 16)
+              let n = shim_hunt_predict(pid, ot, rp, 90000, &cands, 16)
+              if n < 0 { shim_hunt_restore(); return (false, "Couldn't line up the RNG for this encounter.") }
+              for i in 0..<Int(n) {
+                let d = cands[i]
+                DispatchQueue.main.async { self.huntMsg = "Checking frame \(d)…" }
+                var p2: UInt32 = 0, o2: UInt32 = 0, r2: UInt32 = 0
+                if shim_hunt_sim(d, &p2, &o2, &r2) != 0,
+                   ((o2 >> 16) ^ (o2 & 0xFFFF) ^ (p2 >> 16) ^ (p2 & 0xFFFF)) < 8 {
+                  shim_hunt_seek(d)
+                  return (true, "✦ Shiny locked in (wait \(d) frames)")
+                }
+              }
+              shim_hunt_restore()
+              return (false, "No verified shiny frame found. Try again.")
             }
           }
           EOF
