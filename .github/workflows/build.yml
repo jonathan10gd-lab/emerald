@@ -21,7 +21,7 @@ jobs:
               sources: [Sources]
               dependencies: [{package: ZIPFoundation}]
               info:
-                path: Sources/Info.plist
+                path: Info.plist
                 properties:
                   CFBundleDisplayName: Emerald
                   UILaunchScreen: {}
@@ -60,6 +60,7 @@ jobs:
             core = mCoreFind(path); if (!core) return 0;
             core->init(core); mCoreInitConfig(core, NULL);
             core->baseVideoSize(core, &W, &H);
+            core->setAudioBufferSize(core, 1024);
             vbuf = calloc(W * H, 4); core->setVideoBuffer(core, vbuf, W);
             if (!mCoreLoadFile(core, path)) return 0;
             mCoreAutoloadSave(core);
@@ -139,7 +140,7 @@ jobs:
             required init?(coder: NSCoder) { fatalError() }
           }
 
-          final class Emu: ObservableObject {
+          final class Emu: NSObject, ObservableObject {
             @Published var running = false
             @Published var error: String?
             @Published var party: [Mon] = []
@@ -316,6 +317,7 @@ jobs:
       - name: Build mGBA for iOS
         run: |
           git clone --depth 1 --branch 0.10.3 https://github.com/mgba-emu/mgba mgba
+          grep -rl popcount32 mgba/src | xargs sed -i '' '/inline/!s/popcount32(/__builtin_popcount(/g' || true
           cmake -S mgba -B build -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -325,7 +327,7 @@ jobs:
             -DUSE_FFMPEG=OFF -DUSE_PNG=OFF -DUSE_LIBZIP=OFF -DUSE_MINIZIP=OFF -DUSE_LZMA=OFF -DUSE_SQLITE3=OFF \
             -DUSE_ELF=OFF -DUSE_EDITLINE=OFF -DUSE_EPOXY=OFF -DUSE_DISCORD_RPC=OFF -DUSE_DEBUGGERS=OFF \
             -DENABLE_SCRIPTING=OFF -DENABLE_GDB_STUB=OFF
-          cmake --build build --target mgba -j4
+          cmake --build build --target mgba -j4 -- -k
           ls -la build/*.a
       - name: Build app
         run: |
